@@ -14,7 +14,16 @@ const { verify } = require('crypto');
 const mongoose = require('mongoose');
 const { GoogleGenerativeAI } = require('@google/generative-ai');
 require('dotenv').config();
+app.set('view engine', 'ejs');
+app.set('layout', 'layout');
+app.set('views', path.join(__dirname, 'views'));
+app.use(expressLayouts);
 
+app.use(express.json());
+app.use(express.urlencoded({ extended: true }));
+app.use(cookieParser())
+app.use(express.static(path.join(__dirname, "public")));
+app.set('views', path.join(__dirname, 'views'));
 // Validate environment variables
 if (!process.env.GEMINI_API_KEY) {
   console.error('Error: GEMINI_API_KEY is not set in .env file');
@@ -193,14 +202,7 @@ mongoose.connection.on('disconnected', () => {
   console.log('Mongoose disconnected from MongoDB');
 });
 
-app.set('view engine', 'ejs');
-app.set('layout', 'layout');
-app.use(expressLayouts);
 
-app.use(express.json());
-app.use(express.urlencoded({ extended: true }));
-app.use(cookieParser())
-app.use(express.static(path.join(__dirname, "public")));
 
 // Add middleware to make user authentication state available to all pages
 app.use(async (req, res, next) => {
