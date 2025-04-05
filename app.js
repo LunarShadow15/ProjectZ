@@ -11,7 +11,7 @@ const { categorizeComplaint, getGovernmentSchemeInfo } = require('./utils/catego
 const { sendStatusUpdateEmail } = require('./utils/email');
 const cookieParser = require('cookie-parser');
 const { verify } = require('crypto');
-const mongoose = require('mongoose');
+const { connectToDB } = require('./db');
 const { GoogleGenerativeAI } = require('@google/generative-ai');
 require('dotenv').config();
 app.set('view engine', 'ejs');
@@ -122,72 +122,8 @@ try {
   Complaint = mongoose.model('Complaint', complaintSchema);
 }
 
-// MongoDB Connection with enhanced error handling
-console.log('Attempting to connect to MongoDB...');
-mongoose.connect('mongodb://127.0.0.1:27017/Data-Association', {
-  useNewUrlParser: true,
-  useUnifiedTopology: true,
-  serverSelectionTimeoutMS: 5000,
-  socketTimeoutMS: 45000,
-  connectTimeoutMS: 10000,
-  retryWrites: true,
-  retryReads: true,
-  maxPoolSize: 10,
-  minPoolSize: 5
-})
-  .then(() => {
-    console.log('Connected to MongoDB successfully');
-
-    // Create default admin account if it doesn't exist
-    createDefaultAdmin();
-  })
-  .catch((err) => {
-    console.error('MongoDB connection error details:', {
-      name: err.name,
-      message: err.message,
-      code: err.code,
-      codeName: err.codeName
-    });
-    // Don't exit immediately, try to reconnect
-    console.log('Attempting to reconnect...');
-    setTimeout(() => {
-      mongoose.connect('mongodb://localhost:27017/Data-Association', {
-        useNewUrlParser: true,
-        useUnifiedTopology: true
-      }).catch(console.error);
-    }, 5000);
-  });
-
-// Function to create default admin account
-async function createDefaultAdmin() {
-  try {
-    // Check if admin already exists
-    const adminExists = await usermodel.findOne({ role: 'ADMIN' });
-
-    if (!adminExists) {
-      // Create default admin account
-      const salt = await bcrypt.genSalt(10);
-      const hash = await bcrypt.hash('admin123', salt);
-
-      await usermodel.create({
-        username: 'admin',
-        name: 'Administrator',
-        age: 30,
-        email: 'admin@example.com',
-        password: hash,
-        role: 'ADMIN'
-      });
-
-      console.log('Default admin account created successfully');
-      console.log('Email: admin@example.com');
-      console.log('Password: admin123');
-    } else {
-      console.log('Admin account already exists');
-    }
-  } catch (error) {
-    console.error('Error creating default admin account:', error);
-  }
-}
+// Connect to database
+connectToDB().catch(console.error);
 
 // Add connection event listeners
 mongoose.connection.on('connected', () => {
@@ -201,8 +137,6 @@ mongoose.connection.on('error', (err) => {
 mongoose.connection.on('disconnected', () => {
   console.log('Mongoose disconnected from MongoDB');
 });
-
-
 
 // Add middleware to make user authentication state available to all pages
 app.use(async (req, res, next) => {
@@ -250,31 +184,40 @@ app.get("/profile", isLoggedIn, async (req, res) => {
   res.redirect(`/profile/${req.user.username}`);
 })
 
-// New username-based profile route
+// Optimize profile route with lean() and select()
 app.get("/profile/:username", isLoggedIn, async (req, res) => {
   try {
-    let displaydata = await usermodel.find();
-    let user = await usermodel.findOne({ username: req.params.username }).populate("posts");
+    // Use lean() for faster query processing and select only needed fields
+    const [displaydata, user] = await Promise.all([
+      usermodel.find().lean().select('username email role'),
+      usermodel.findOne({ username: req.params.username })
+        .populate({
+          path: 'posts',
+          options: { lean: true }
+        })
+        .lean()
+    ]);
 
-    // If user not found, redirect to the logged-in user's profile
     if (!user) {
-      // If username is not in the token, fetch it from the database
       if (!req.user.username) {
-        const userFromDb = await usermodel.findById(req.user.userId);
+        const userFromDb = await usermodel.findById(req.user.userId)
+          .lean()
+          .select('username');
         if (userFromDb) {
           req.user.username = userFromDb.username;
         } else {
-          // If user not found in database, redirect to home
           return res.redirect('/');
         }
       }
       return res.redirect(`/profile/${req.user.username}`);
     }
 
-    // Get the logged-in user's full information
-    const loggedInUser = await usermodel.findById(req.user.userId);
+    const loggedInUser = await usermodel.findById(req.user.userId)
+      .lean()
+      .select('_id role');
 
-    let blogg = await postmodel.find();
+    const blogg = await postmodel.find().lean();
+
     res.render('profile', {
       title: 'Profile',
       user,
@@ -614,10 +557,14 @@ app.post('/complaints', isLoggedIn, async (req, res) => {
   }
 });
 
+// Optimize complaint routes
 app.get('/my-complaints', isLoggedIn, async (req, res) => {
   try {
-    // Fetch complaints for the current user using the correct user ID field
-    const complaints = await Complaint.find({ userId: req.user.userId }).sort({ createdAt: -1 });
+    // Use lean() and select only needed fields
+    const complaints = await Complaint.find({ userId: req.user.userId })
+      .lean()
+      .select('title description status trackingId createdAt category')
+      .sort({ createdAt: -1 });
 
     res.render('my-complaints', {
       title: 'My Complaints',
@@ -653,25 +600,31 @@ app.get('/complaint/:id', isLoggedIn, async (req, res) => {
   }
 });
 
-// Admin dashboard for complaints
+// Optimize admin complaints route
 app.get('/admin-complaints', isLoggedIn, isOfficer, async (req, res) => {
   try {
-    // Fetch all complaints using the main Complaint model
-    const complaints = await Complaint.find().sort({ createdAt: -1 });
+    // Use Promise.all for parallel queries and lean()
+    const [complaints, officers] = await Promise.all([
+      Complaint.find()
+        .lean()
+        .sort({ createdAt: -1 }),
+      usermodel.find({ role: 'OFFICER' })
+        .lean()
+        .select('username department')
+    ]);
     
-    // Get all officers for assignment dropdown
-    const officers = await usermodel.find({ role: 'OFFICER' });
+    // Use Map for O(1) officer lookups
+    const officerMap = new Map(
+      officers.map(officer => [officer._id.toString(), officer])
+    );
     
-    // Transform complaints to include category field and populate assigned officer
-    const transformedComplaints = await Promise.all(complaints.map(async complaint => {
-      const complaintObj = complaint.toObject();
-      
-      // Set default category if not present
+    // Transform complaints efficiently
+    const transformedComplaints = complaints.map(complaint => {
+      const complaintObj = { ...complaint };
       complaintObj.category = complaintObj.category || 'OTHER';
       
-      // Populate assigned officer if exists
       if (complaintObj.assignedOfficer) {
-        const officer = await usermodel.findById(complaintObj.assignedOfficer);
+        const officer = officerMap.get(complaintObj.assignedOfficer.toString());
         if (officer) {
           complaintObj.assignedOfficer = {
             _id: officer._id,
@@ -682,7 +635,7 @@ app.get('/admin-complaints', isLoggedIn, isOfficer, async (req, res) => {
       }
       
       return complaintObj;
-    }));
+    });
 
     res.render('admin-complaints', {
       title: 'Manage Complaints',
@@ -767,25 +720,27 @@ app.post('/update-complaint-status', isLoggedIn, isOfficer, async (req, res) => 
   }
 });
 
-// Admin dashboard route
+// Optimize admin dashboard route
 app.get('/admin', isLoggedIn, isAdmin, async (req, res) => {
   try {
-    const officers = await usermodel.find({ role: 'OFFICER' });
-    const citizens = await usermodel.find({ role: 'CITIZEN' });
+    // Use Promise.all for parallel queries and lean()
+    const [officers, citizens, complaints] = await Promise.all([
+      usermodel.find({ role: 'OFFICER' }).lean().select('username department'),
+      usermodel.find({ role: 'CITIZEN' }).lean().select('username email'),
+      Complaint.find().lean().sort({ createdAt: -1 })
+    ]);
 
-    // Fetch all complaints using the main Complaint model
-    const complaints = await Complaint.find().sort({ createdAt: -1 });
+    // Use Map for efficient officer lookups
+    const officerMap = new Map(
+      officers.map(officer => [officer._id.toString(), officer])
+    );
 
-    // Transform complaints to include category field and populate assigned officer
-    const transformedComplaints = await Promise.all(complaints.map(async complaint => {
-      const complaintObj = complaint.toObject();
-      
-      // Set default category if not present
+    const transformedComplaints = complaints.map(complaint => {
+      const complaintObj = { ...complaint };
       complaintObj.category = complaintObj.category || 'OTHER';
       
-      // Populate assigned officer if exists
       if (complaintObj.assignedOfficer) {
-        const officer = await usermodel.findById(complaintObj.assignedOfficer);
+        const officer = officerMap.get(complaintObj.assignedOfficer.toString());
         if (officer) {
           complaintObj.assignedOfficer = {
             _id: officer._id,
@@ -796,7 +751,7 @@ app.get('/admin', isLoggedIn, isAdmin, async (req, res) => {
       }
       
       return complaintObj;
-    }));
+    });
 
     res.render('admin-dashboard', {
       title: 'Admin Dashboard',
@@ -1124,5 +1079,13 @@ app.get('/assigned-complaints', isLoggedIn, isOfficer, async (req, res) => {
     });
   }
 });
+
+// Add indexes for frequently queried fields
+Complaint.collection.createIndex({ userId: 1, createdAt: -1 });
+Complaint.collection.createIndex({ trackingId: 1 }, { unique: true });
+Complaint.collection.createIndex({ assignedOfficer: 1 });
+usermodel.collection.createIndex({ email: 1 }, { unique: true });
+usermodel.collection.createIndex({ username: 1 }, { unique: true });
+usermodel.collection.createIndex({ role: 1 });
 
 app.listen(3000);
